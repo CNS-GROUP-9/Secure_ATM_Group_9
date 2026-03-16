@@ -30,8 +30,8 @@ assert_exit() {
 }
 
 build_binaries() {
-  gcc atm.c cli.c network.c -o atm || return 1
-  gcc bank.c cli.c network.c -o bank -lpthread || return 1
+  gcc atm.c cli.c network.c crypto.c -o atm -lcrypto || return 1
+  gcc bank.c cli.c network.c crypto.c -o bank -lpthread -lcrypto || return 1
   return 0
 }
 
@@ -67,7 +67,7 @@ run_tests() {
   local single_out="${tag}.single.bank.out"
   local test_port=35555
 
-  trap 'if [ -n "${bank_pid:-}" ]; then kill -TERM "$bank_pid" 2>/dev/null; wait "$bank_pid" 2>/dev/null; fi; if [ -n "${single_pid:-}" ]; then kill -TERM "$single_pid" 2>/dev/null; wait "$single_pid" 2>/dev/null; fi; rm -f "${auth_file:-}" "${single_auth:-}" "${bank_out:-}" "${single_out:-}"' EXIT
+  trap 'if [ -n "${bank_pid:-}" ]; then kill -TERM "$bank_pid" 2>/dev/null; wait "$bank_pid" 2>/dev/null; fi; if [ -n "${single_pid:-}" ]; then kill -TERM "$single_pid" 2>/dev/null; wait "$single_pid" 2>/dev/null; fi; rm -f "${auth_file:-}" "${single_auth:-}" "${bank_out:-}" "${single_out:-}" manoj_test_*.auth manoj_test_*.bank.out manoj_test_*_single.auth atm bank' EXIT
 
   if ! build_binaries; then
     echo "Build failed"
@@ -118,7 +118,7 @@ run_tests() {
   wait "$bank_pid" 2>/dev/null
   unset bank_pid
 
-  assert_exit 63 "ATM returns 63 when bank unavailable" ./atm -a alice -g -p 36666
+  assert_exit 63 "ATM returns 63 when bank unavailable" ./atm -a alice -g -p 36666 -s "$auth_file"
 
   echo
   echo "Total: $pass_count passed, $fail_count failed"
