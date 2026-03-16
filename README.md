@@ -5,6 +5,7 @@
 Command-line Parser + Network Communication Module: complete and tested.
 
 Implemented:
+
 - ATM argument parsing for `-a -n -d -w -g -s -i -p -c`
 - strict validation (duplicates, formats, ranges, defaults)
 - bank argument parsing for `-p -s`
@@ -14,11 +15,32 @@ Implemented:
 - bank thread-per-connection model
 - bank auth-file creation on startup
 
+## Saharsh Module Status
+
+Cryptographic Module + Protocol Serialization Module: complete and tested.
+
+Implemented:
+
+- auth-file secret loading from bank-generated hex key material
+- key derivation for separate encryption and MAC keys
+- AES-256-CBC encryption for protocol payloads
+- HMAC-SHA256 authentication over encrypted payloads
+- encrypt-then-MAC and verify-then-decrypt helpers
+- secure memory wiping for derived secrets and plaintext buffers
+- protocol request struct for ATM-to-bank messages
+- protocol response struct for bank-to-ATM messages
+- serialization of request/response payloads into JSON-like plaintext
+- deserialization and validation of decrypted request/response payloads
+- nonce generation for per-request freshness
+- amount conversion to integer cents before serialization
+- ATM integration: build request, serialize, encrypt, send
+- bank integration: receive, decrypt, deserialize, validate
+
 ## Build
 
 ```bash
-gcc atm.c cli.c network.c -o atm
-gcc bank.c cli.c network.c -o bank -lpthread
+gcc atm.c cli.c network.c crypto.c protocol.c -o atm -lcrypto
+gcc bank.c cli.c network.c crypto.c protocol.c -o bank -lpthread -lcrypto
 ```
 
 ## Verify (WSL)
@@ -28,10 +50,12 @@ wsl bash -lc "cd '/mnt/c/Users/Manoj/OneDrive/Acads/sem 6/CNS/CNS_Proj'; ./test_
 ```
 
 Expected result:
+
 - all tests pass
 - summary prints `Total: 13 passed, 0 failed`
 
 Tested:
+
 - build succeeds for `atm` and `bank`
 - ATM rejects invalid CLI inputs with exit `255`
 - duplicate mode/options are rejected
@@ -40,23 +64,43 @@ Tested:
 - bank rejects existing auth file with exit `255`
 - bank accepts ATM connection and framed request path works
 - ATM returns exit `63` when bank is unreachable
+- encrypted message path works between ATM and bank
+- malformed decrypted request payloads are rejected as protocol errors
+- serialized request format is accepted by bank worker after decryption
 
 ## Next Member Handoff
 
-For Saharsh (Crypto + Serialization):
-- Replace ATM placeholder payload in `atm.c` with serialized request bytes.
-- Encrypt and authenticate payload before calling `send_message()`.
-- In bank worker (`handle_client`), verify and decrypt bytes returned by `receive_message()`.
-
 For Praneeth (DB + Card File):
-- After bank decrypts request, apply account/card checks and balance logic.
-- Return structured response payload for ATM to decode.
-- Keep transaction processing atomic around shared account state.
+
+- Implement account database storage in bank memory.
+- Store at minimum: account name, balance in cents, and card secret.
+- Use integer cents internally for balances and transaction amounts.
+- Add create/deposit/withdraw/get handlers after request deserialization in `bank.c`.
+- Reject invalid business logic with exit/response behavior required by spec.
+- Create and read card files in ATM using the validated account/card filename inputs from `cli.c`.
+- On `-n`, generate a new card secret, write the card file, and include that secret in the account-creation flow.
+- On `-d`, `-w`, and `-g`, read the card file and attach/validate account ownership data.
+- Extend `ProtocolRequest` and `ProtocolResponse` in `protocol.h` if card-secret or status fields are needed.
+- Update `protocol.c` serializer/deserializer consistently on both ATM and bank sides if message fields change.
+- After business logic is implemented, ATM should decrypt and deserialize bank responses instead of only sending requests.
+- Print final JSON outputs exactly as required by the assignment after successful operations.
 
 Stable integration points already ready:
+
 - argument parsing: `parse_atm_args()`, `parse_bank_args()` in `cli.c`
 - transport framing: `send_message()`, `receive_message()` in `network.c`
+- crypto helpers: `crypto_load_auth_secret()`, `crypto_derive_keys()`, `crypto_encrypt_then_mac()`, `crypto_verify_then_decrypt()` in `crypto.c`
+- protocol helpers: `proto_serialize_request()`, `proto_deserialize_request()`, `proto_serialize_response()`, `proto_deserialize_response()` in `protocol.c`
 - server concurrency path: `handle_client()` in `bank.c`
+
+Suggested implementation order for Praneeth:
+
+1. Add account and card-secret fields to protocol messages as needed.
+2. Implement card file generation and loading in ATM.
+3. Implement in-memory account database in bank.
+4. Process each deserialized request in `handle_client()`.
+5. Serialize, encrypt, send bank responses back to ATM.
+6. Deserialize bank responses in ATM and print spec-compliant JSON.
 
 ## Quick Manual Run
 
