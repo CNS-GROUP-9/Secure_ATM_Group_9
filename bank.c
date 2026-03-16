@@ -10,6 +10,7 @@
 #include "cli.h"
 #include "crypto.h"
 #include "network.h"
+#include "protocol.h"
 
 static volatile sig_atomic_t g_running = 1;
 static int g_listen_sock = -1;
@@ -110,6 +111,7 @@ static void *handle_client(void *arg)
     void *msg = NULL;
     uint8_t *plaintext = NULL;
     size_t plaintext_len = 0;
+    ProtocolRequest request;
     int len;
 
     free(arg);
@@ -133,6 +135,19 @@ static void *handle_client(void *arg)
         close(client);
         return NULL;
     }
+
+    if (proto_deserialize_request(plaintext, plaintext_len, &request) != 0)
+    {
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        printf("protocol_error\n");
+        fflush(stdout);
+        close(client);
+        return NULL;
+    }
+
+    (void)request;
 
     crypto_secure_memzero(plaintext, plaintext_len);
     free(plaintext);

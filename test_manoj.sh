@@ -30,8 +30,8 @@ assert_exit() {
 }
 
 build_binaries() {
-  gcc atm.c cli.c network.c crypto.c -o atm -lcrypto || return 1
-  gcc bank.c cli.c network.c crypto.c -o bank -lpthread -lcrypto || return 1
+  gcc atm.c cli.c network.c crypto.c protocol.c -o atm -lcrypto || return 1
+  gcc bank.c cli.c network.c crypto.c protocol.c -o bank -lpthread -lcrypto || return 1
   return 0
 }
 
