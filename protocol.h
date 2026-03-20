@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "crypto.h"
 
 #define PROTOCOL_MAX_ACCOUNT_LEN 122
 
@@ -21,6 +22,8 @@ typedef struct
     uint64_t nonce;
     int has_amount;
     uint64_t amount_cents;
+    /* hex-encoded card secret (64 hex chars + '\0') */
+    char card_hex[AUTH_SECRET_BYTES * 2 + 1];
 } ProtocolRequest;
 
 typedef struct

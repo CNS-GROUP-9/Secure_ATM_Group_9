@@ -6,6 +6,9 @@
 #include "crypto.h"
 #include "network.h"
 #include "protocol.h"
+#include <openssl/rand.h>
+#include <errno.h>
+#include <ctype.h>
 
 int main(int argc, char **argv)
 {
@@ -45,6 +48,81 @@ int main(int argc, char **argv)
     if (proto_generate_nonce(&request.nonce) != 0)
     {
         exit(255);
+    }
+
+    /* card handling: on create (-n) generate new card secret and write to card file; otherwise read card file */
+    request.card_hex[0] = '\0';
+    if (args.mode == 1) /* create */
+    {
+        unsigned char card_secret[AUTH_SECRET_BYTES];
+        char hex[AUTH_SECRET_BYTES * 2 + 2];
+        static const char digits[] = "0123456789abcdef";
+        size_t i;
+
+        if (access(args.card_file, F_OK) == 0)
+        {
+            /* already exists */
+            exit(255);
+        }
+        if (RAND_bytes(card_secret, sizeof(card_secret)) != 1)
+        {
+            exit(255);
+        }
+        for (i = 0; i < sizeof(card_secret); i++)
+        {
+            hex[i * 2] = digits[(card_secret[i] >> 4) & 0xF];
+            hex[i * 2 + 1] = digits[card_secret[i] & 0xF];
+        }
+        hex[AUTH_SECRET_BYTES * 2] = '\n';
+        hex[AUTH_SECRET_BYTES * 2 + 1] = '\0';
+        FILE *f = fopen(args.card_file, "wb");
+        if (!f)
+        {
+            exit(255);
+        }
+        if (fwrite(hex, 1, AUTH_SECRET_BYTES * 2 + 1, f) != AUTH_SECRET_BYTES * 2 + 1)
+        {
+            fclose(f);
+            unlink(args.card_file);
+            exit(255);
+        }
+        if (fflush(f) != 0) { fclose(f); unlink(args.card_file); exit(255); }
+        if (fclose(f) != 0) { unlink(args.card_file); exit(255); }
+        /* set card_hex (without newline) */
+        memcpy(request.card_hex, hex, AUTH_SECRET_BYTES * 2 + 1);
+        request.card_hex[AUTH_SECRET_BYTES * 2] = '\0';
+        crypto_secure_memzero(card_secret, sizeof(card_secret));
+    }
+    else
+    {
+        /* read existing card file */
+        FILE *f = fopen(args.card_file, "rb");
+        if (!f)
+        {
+            exit(255);
+        }
+        char line[AUTH_SECRET_BYTES * 2 + 16];
+        if (fgets(line, sizeof(line), f) == NULL)
+        {
+            fclose(f);
+            exit(255);
+        }
+        fclose(f);
+        size_t len = strcspn(line, "\r\n");
+        if (len != AUTH_SECRET_BYTES * 2)
+        {
+            exit(255);
+        }
+        memcpy(request.card_hex, line, AUTH_SECRET_BYTES * 2);
+        request.card_hex[AUTH_SECRET_BYTES * 2] = '\0';
+        /* validate hex chars */
+        for (size_t i = 0; i < AUTH_SECRET_BYTES * 2; ++i)
+        {
+            if (!isxdigit((unsigned char)request.card_hex[i]))
+            {
+                exit(255);
+            }
+        }
     }
     if (proto_serialize_request(&request, &plaintext, &plaintext_len) != 0)
     {
@@ -103,8 +181,85 @@ int main(int argc, char **argv)
         exit(63);
     }
 
-    crypto_secure_memzero(wire, wire_len);
+    /* wait for response */
+    int resp_len = receive_message(sock, (void **)&wire);
+    if (resp_len < 0)
+    {
+        crypto_secure_memzero(wire, wire_len);
+        free(wire);
+        close(sock);
+        crypto_secure_memzero(&keys, sizeof(keys));
+        exit(63);
+    }
+
+    uint8_t *resp_plain = NULL;
+    size_t resp_plain_len = 0;
+    if (crypto_verify_then_decrypt(&keys, wire, (size_t)resp_len, &resp_plain, &resp_plain_len) != 0)
+    {
+        free(wire);
+        close(sock);
+        crypto_secure_memzero(&keys, sizeof(keys));
+        exit(63);
+    }
     free(wire);
+
+    ProtocolResponse response;
+    if (proto_deserialize_response(resp_plain, resp_plain_len, &response) != 0)
+    {
+        crypto_secure_memzero(resp_plain, resp_plain_len);
+        free(resp_plain);
+        close(sock);
+        crypto_secure_memzero(&keys, sizeof(keys));
+        exit(63);
+    }
+
+    /* business failure (ok==0) -> ATM should exit 255 per spec */
+    if (!response.ok)
+    {
+        crypto_secure_memzero(resp_plain, resp_plain_len);
+        free(resp_plain);
+        close(sock);
+        crypto_secure_memzero(&keys, sizeof(keys));
+        exit(255);
+    }
+
+    /* helper: format cents -> minimal decimal string */
+    char amt_buf[64];
+    uint64_t cents = response.amount_cents;
+    if ((cents % 100) == 0)
+    {
+        snprintf(amt_buf, sizeof(amt_buf), "%llu", (unsigned long long)(cents / 100));
+    }
+    else if ((cents % 10) == 0)
+    {
+        /* one decimal */
+        snprintf(amt_buf, sizeof(amt_buf), "%llu.%llu", (unsigned long long)(cents / 100), (unsigned long long)((cents % 100) / 10));
+    }
+    else
+    {
+        snprintf(amt_buf, sizeof(amt_buf), "%llu.%02llu", (unsigned long long)(cents / 100), (unsigned long long)(cents % 100));
+    }
+
+    if (args.mode == 1)
+    {
+        printf("{\"account\":\"%s\",\"initial_balance\":%s}\n", request.account, amt_buf);
+    }
+    else if (args.mode == 2)
+    {
+        printf("{\"account\":\"%s\",\"deposit\":%s}\n", request.account, amt_buf);
+    }
+    else if (args.mode == 3)
+    {
+        printf("{\"account\":\"%s\",\"withdraw\":%s}\n", request.account, amt_buf);
+    }
+    else if (args.mode == 4)
+    {
+        printf("{\"account\":\"%s\",\"balance\":%s}\n", request.account, amt_buf);
+    }
+    fflush(stdout);
+
+    crypto_secure_memzero(resp_plain, resp_plain_len);
+    free(resp_plain);
     close(sock);
     crypto_secure_memzero(&keys, sizeof(keys));
     return 0;

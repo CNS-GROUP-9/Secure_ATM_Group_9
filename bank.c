@@ -147,7 +147,276 @@ static void *handle_client(void *arg)
         return NULL;
     }
 
-    (void)request;
+    /* Process business logic using an in-memory DB protecting with mutex */
+    /* Process business logic using an in-memory DB protecting with mutex */
+    typedef struct Account {
+        char name[PROTOCOL_MAX_ACCOUNT_LEN + 1];
+        uint64_t balance_cents;
+        char card_hex[AUTH_SECRET_BYTES * 2 + 1];
+        struct Account *next;
+    } Account;
+
+    static Account *g_accounts = NULL;
+    static pthread_mutex_t g_accounts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    ProtocolResponse response;
+    memset(&response, 0, sizeof(response));
+    snprintf(response.account, sizeof(response.account), "%s", request.account);
+
+    int send_protocol_error = 0;
+    int business_fail = 0;
+
+    pthread_mutex_lock(&g_accounts_lock);
+
+    /* find account */
+    Account *cur = g_accounts;
+    Account *found = NULL;
+    while (cur)
+    {
+        if (strcmp(cur->name, request.account) == 0)
+        {
+            found = cur;
+            break;
+        }
+        cur = cur->next;
+    }
+
+    if (request.operation == PROTO_OP_CREATE)
+    {
+        /* card_hex must be present */
+        if (request.card_hex[0] == '\0' || request.has_amount == 0)
+        {
+            send_protocol_error = 1;
+        }
+        else if (found != NULL)
+        {
+            /* account exists */
+            business_fail = 1;
+        }
+        else
+        {
+            /* create new account */
+            /* validate card_hex hex chars */
+            for (size_t _i = 0; _i < AUTH_SECRET_BYTES * 2; ++_i)
+            {
+                unsigned char cc = (unsigned char)request.card_hex[_i];
+                if (!((cc >= '0' && cc <= '9') || (cc >= 'a' && cc <= 'f') || (cc >= 'A' && cc <= 'F')))
+                {
+                    send_protocol_error = 1;
+                    break;
+                }
+            }
+            if (send_protocol_error)
+            {
+                /* leave send_protocol_error set */
+            }
+            else
+            {
+            Account *a = (Account *)malloc(sizeof(Account));
+            if (!a)
+            {
+                send_protocol_error = 1;
+            }
+            else
+            {
+                memset(a, 0, sizeof(*a));
+                snprintf(a->name, sizeof(a->name), "%s", request.account);
+                a->balance_cents = request.amount_cents;
+                snprintf(a->card_hex, sizeof(a->card_hex), "%s", request.card_hex);
+                a->next = g_accounts;
+                g_accounts = a;
+
+                response.ok = 1;
+                response.has_amount = 1;
+                response.amount_cents = a->balance_cents;
+            }
+            }
+        }
+    }
+    else if (request.operation == PROTO_OP_DEPOSIT)
+    {
+        if (request.has_amount == 0 || request.card_hex[0] == '\0')
+        {
+            send_protocol_error = 1;
+        }
+        else if (found == NULL)
+        {
+            business_fail = 1;
+        }
+        else if (strcmp(found->card_hex, request.card_hex) != 0)
+        {
+            business_fail = 1;
+        }
+        else
+        {
+            found->balance_cents += request.amount_cents;
+            response.ok = 1;
+            response.has_amount = 1;
+            response.amount_cents = request.amount_cents;
+        }
+    }
+    else if (request.operation == PROTO_OP_WITHDRAW)
+    {
+        if (request.has_amount == 0 || request.card_hex[0] == '\0')
+        {
+            send_protocol_error = 1;
+        }
+        else if (found == NULL)
+        {
+            business_fail = 1;
+        }
+        else if (strcmp(found->card_hex, request.card_hex) != 0)
+        {
+            business_fail = 1;
+        }
+        else if (found->balance_cents < request.amount_cents)
+        {
+            business_fail = 1;
+        }
+        else
+        {
+            found->balance_cents -= request.amount_cents;
+            response.ok = 1;
+            response.has_amount = 1;
+            response.amount_cents = request.amount_cents;
+        }
+    }
+    else if (request.operation == PROTO_OP_GET)
+    {
+        if (request.card_hex[0] == '\0')
+        {
+            send_protocol_error = 1;
+        }
+        else if (found == NULL)
+        {
+            business_fail = 1;
+        }
+        else if (strcmp(found->card_hex, request.card_hex) != 0)
+        {
+            business_fail = 1;
+        }
+        else
+        {
+            response.ok = 1;
+            response.has_amount = 1;
+            response.amount_cents = found->balance_cents;
+        }
+    }
+    else
+    {
+        send_protocol_error = 1;
+    }
+
+    /* prepare minimal-decimal amount string and print bank-side JSON while holding lock to preserve ordering */
+    char amt_buf[64];
+    if (response.has_amount)
+    {
+        uint64_t cents = response.amount_cents;
+        if ((cents % 100) == 0)
+        {
+            snprintf(amt_buf, sizeof(amt_buf), "%llu", (unsigned long long)(cents / 100));
+        }
+        else if ((cents % 10) == 0)
+        {
+            snprintf(amt_buf, sizeof(amt_buf), "%llu.%llu", (unsigned long long)(cents / 100), (unsigned long long)((cents % 100) / 10));
+        }
+        else
+        {
+            snprintf(amt_buf, sizeof(amt_buf), "%llu.%02llu", (unsigned long long)(cents / 100), (unsigned long long)(cents % 100));
+        }
+    }
+
+    pthread_mutex_unlock(&g_accounts_lock);
+
+    if (send_protocol_error)
+    {
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    if (business_fail)
+    {
+        /* send ok=0 response (no bank JSON printed) */
+        response.ok = 0;
+        response.has_amount = 0;
+        response.amount_cents = 0;
+    }
+    else if (response.ok)
+    {
+        /* print bank-side JSON summary matching ATM output */
+        switch (request.operation)
+        {
+        case PROTO_OP_CREATE:
+            printf("{\"account\":\"%s\",\"initial_balance\":%s}\n", request.account, amt_buf);
+            break;
+        case PROTO_OP_DEPOSIT:
+            printf("{\"account\":\"%s\",\"deposit\":%s}\n", request.account, amt_buf);
+            break;
+        case PROTO_OP_WITHDRAW:
+            printf("{\"account\":\"%s\",\"withdraw\":%s}\n", request.account, amt_buf);
+            break;
+        case PROTO_OP_GET:
+            printf("{\"account\":\"%s\",\"balance\":%s}\n", request.account, amt_buf);
+            break;
+        default:
+            break;
+        }
+        fflush(stdout);
+    }
+
+    /* build response, serialize, encrypt, and send back */
+    uint8_t *resp_plain = NULL;
+    size_t resp_plain_len = 0;
+    if (proto_serialize_response(&response, &resp_plain, &resp_plain_len) != 0)
+    {
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (crypto_encrypt_then_mac(&g_keys, resp_plain, resp_plain_len, &wire, &wire_len) != 0)
+    {
+        crypto_secure_memzero(resp_plain, resp_plain_len);
+        free(resp_plain);
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    crypto_secure_memzero(resp_plain, resp_plain_len);
+    free(resp_plain);
+
+    if (wire_len > 2147483647ULL || send_message(client, wire, (int)wire_len) != 0)
+    {
+        crypto_secure_memzero(wire, wire_len);
+        free(wire);
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    crypto_secure_memzero(wire, wire_len);
+    free(wire);
+>>>>>>> 8b48bc5 (Db + card file)
 
     crypto_secure_memzero(plaintext, plaintext_len);
     free(plaintext);

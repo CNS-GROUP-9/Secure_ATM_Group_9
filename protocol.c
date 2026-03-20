@@ -223,21 +223,38 @@ int proto_serialize_request(const ProtocolRequest *request, uint8_t **out, size_
         n = snprintf(
             buffer,
             sizeof(buffer),
+<<<<<<< HEAD
             "{\"account\":\"%s\",\"operation\":\"%s\",\"amount_cents\":%llu,\"nonce\":%llu}",
             request->account,
             op_name,
             (unsigned long long)request->amount_cents,
             (unsigned long long)request->nonce);
+=======
+            "{\"account\":\"%s\",\"operation\":\"%s\",\"amount_cents\":%llu,\"nonce\":%llu,\"card_hex\":\"%s\"}",
+            request->account,
+            op_name,
+            (unsigned long long)request->amount_cents,
+            (unsigned long long)request->nonce,
+            request->card_hex);
+>>>>>>> 8b48bc5 (Db + card file)
     }
     else
     {
         n = snprintf(
             buffer,
             sizeof(buffer),
+<<<<<<< HEAD
             "{\"account\":\"%s\",\"operation\":\"%s\",\"nonce\":%llu}",
             request->account,
             op_name,
             (unsigned long long)request->nonce);
+=======
+            "{\"account\":\"%s\",\"operation\":\"%s\",\"nonce\":%llu,\"card_hex\":\"%s\"}",
+            request->account,
+            op_name,
+            (unsigned long long)request->nonce,
+            request->card_hex);
+>>>>>>> 8b48bc5 (Db + card file)
     }
 
     if (n < 0 || (size_t)n >= sizeof(buffer))
@@ -284,6 +301,11 @@ int proto_deserialize_request(const uint8_t *data, size_t data_len, ProtocolRequ
     has_operation = find_string_value(json, "operation", operation_buf, sizeof(operation_buf));
     has_nonce = find_uint64_value(json, "nonce", &nonce);
     has_amount = find_uint64_value(json, "amount_cents", &amount_cents);
+<<<<<<< HEAD
+=======
+    /* optional card_hex */
+    find_string_value(json, "card_hex", request->card_hex, sizeof(request->card_hex));
+>>>>>>> 8b48bc5 (Db + card file)
 
     if (has_account != 1 || has_operation != 1 || has_nonce != 1)
     {
@@ -319,6 +341,12 @@ int proto_deserialize_request(const uint8_t *data, size_t data_len, ProtocolRequ
         request->amount_cents = amount_cents;
     }
 
+<<<<<<< HEAD
+=======
+    /* card_hex may be empty; ensure NUL termination */
+    request->card_hex[sizeof(request->card_hex) - 1] = '\0';
+
+>>>>>>> 8b48bc5 (Db + card file)
     free(json);
     return 0;
 }
