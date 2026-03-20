@@ -70,6 +70,38 @@ Tested:
 
 ## Next Member Handoff
 
+
+
+-------------
+For Praneeth (DB + Card File): complete and tested.
+
+Implemented:
+
+- Added card-file handling in the ATM: create (`-n`) generates a 32-byte card secret, writes a hex card file, and validates existing card files for other operations.
+- Extended the protocol to carry a hex-encoded card secret (`card_hex`) in `ProtocolRequest` and updated `protocol.c` serializers/deserializers accordingly.
+- Implemented an in-memory bank database (linked list) storing account name, `balance_cents` (uint64_t), and `card_hex`, protected by a mutex.
+- Implemented business handlers in `bank.c`: CREATE (initial balance), DEPOSIT, WITHDRAW (with insufficient-funds check), and GET (balance). All amounts use integer cents internally.
+- Bank prints minimal JSON summaries on successful operations (matching ATM output) while holding the DB lock to preserve ordering.
+- Bank distinguishes protocol errors (prints `protocol_error`) from business failures (sends back `ok=0`); ATM exits with the required codes (255 for business failure, 63 for protocol/timeout errors).
+- ATM now waits for, verifies, decrypts, and deserializes bank responses and prints spec-compliant JSON output.
+- Added `test_praneeth.sh` with positive and negative tests (duplicate create, insufficient funds, wrong card, corrupted card) and verified the flow locally.
+
+Files changed (high level):
+
+- `protocol.h` / `protocol.c` — added `card_hex` field and updated serialization/deserialization.
+- `atm.c` — card-file create/read, include `card_hex` in requests, response decryption and JSON output.
+- `bank.c` — in-memory DB, business handlers, JSON printing, response encryption.
+- `test_praneeth.sh` — automated some positive and negative tests.
+
+Remaining / recommended improvements:
+
+- Replace sending raw card secret over the wire with a proof-of-possession scheme (HMAC over a nonce) to avoid exposing the card secret.
+- Add persistence (on-disk DB) if accounts must survive bank restarts.
+- Add more unit tests and CI (Makefile + workflow) for reproducible builds and automated test runs.
+- Harden input validation and logging, and add limits for number of accounts / memory usage.
+- Consider protocol versioning and backward-compatibility tests if fields change further.
+--------------------------
+
 For Praneeth (DB + Card File):
 
 - Implement account database storage in bank memory.
