@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,68 @@
 static volatile sig_atomic_t g_running = 1;
 static int g_listen_sock = -1;
 static CryptoKeys g_keys;
+
+#define NONCE_WINDOW 64
+
+typedef struct Account
+{
+    char name[PROTOCOL_MAX_ACCOUNT_LEN + 1];
+    uint64_t balance_cents;
+    char card_hex[AUTH_SECRET_BYTES * 2 + 1];
+    uint64_t nonces[NONCE_WINDOW];
+    size_t nonce_count;
+    size_t nonce_next;
+    struct Account *next;
+} Account;
+
+static Account *g_accounts = NULL;
+static pthread_mutex_t g_accounts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int card_hex_valid(const char *card_hex)
+{
+    size_t i;
+    if (card_hex == NULL)
+    {
+        return 0;
+    }
+    if (strlen(card_hex) != AUTH_SECRET_BYTES * 2)
+    {
+        return 0;
+    }
+    for (i = 0; i < AUTH_SECRET_BYTES * 2; i++)
+    {
+        unsigned char c = (unsigned char)card_hex[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int nonce_seen(const Account *account, uint64_t nonce)
+{
+    size_t i;
+    for (i = 0; i < account->nonce_count; i++)
+    {
+        if (account->nonces[i] == nonce)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void nonce_add(Account *account, uint64_t nonce)
+{
+    if (account->nonce_count < NONCE_WINDOW)
+    {
+        account->nonces[account->nonce_count++] = nonce;
+        return;
+    }
+    account->nonces[account->nonce_next] = nonce;
+    account->nonce_next = (account->nonce_next + 1) % NONCE_WINDOW;
+}
 
 static int write_all(int fd, const void *buf, size_t len)
 {
@@ -147,24 +210,18 @@ static void *handle_client(void *arg)
         return NULL;
     }
 
-    /* Process business logic using an in-memory DB protecting with mutex */
-    /* Process business logic using an in-memory DB protecting with mutex */
-    typedef struct Account {
-        char name[PROTOCOL_MAX_ACCOUNT_LEN + 1];
-        uint64_t balance_cents;
-        char card_hex[AUTH_SECRET_BYTES * 2 + 1];
-        struct Account *next;
-    } Account;
-
-    static Account *g_accounts = NULL;
-    static pthread_mutex_t g_accounts_lock = PTHREAD_MUTEX_INITIALIZER;
-
     ProtocolResponse response;
     memset(&response, 0, sizeof(response));
     snprintf(response.account, sizeof(response.account), "%s", request.account);
 
     int send_protocol_error = 0;
     int business_fail = 0;
+    int commit_required = 0;
+    int is_create_commit = 0;
+    uint64_t pending_delta = 0;
+    uint64_t pending_nonce = request.nonce;
+    Account *commit_account = NULL;
+    Account *new_account = NULL;
 
     pthread_mutex_lock(&g_accounts_lock);
 
@@ -183,8 +240,7 @@ static void *handle_client(void *arg)
 
     if (request.operation == PROTO_OP_CREATE)
     {
-        /* card_hex must be present */
-        if (request.card_hex[0] == '\0' || request.has_amount == 0)
+        if (request.has_amount == 0 || !card_hex_valid(request.card_hex))
         {
             send_protocol_error = 1;
         }
@@ -195,47 +251,28 @@ static void *handle_client(void *arg)
         }
         else
         {
-            /* create new account */
-            /* validate card_hex hex chars */
-            for (size_t _i = 0; _i < AUTH_SECRET_BYTES * 2; ++_i)
-            {
-                unsigned char cc = (unsigned char)request.card_hex[_i];
-                if (!((cc >= '0' && cc <= '9') || (cc >= 'a' && cc <= 'f') || (cc >= 'A' && cc <= 'F')))
-                {
-                    send_protocol_error = 1;
-                    break;
-                }
-            }
-            if (send_protocol_error)
-            {
-                /* leave send_protocol_error set */
-            }
-            else
-            {
-            Account *a = (Account *)malloc(sizeof(Account));
-            if (!a)
+            new_account = (Account *)malloc(sizeof(Account));
+            if (!new_account)
             {
                 send_protocol_error = 1;
             }
             else
             {
-                memset(a, 0, sizeof(*a));
-                snprintf(a->name, sizeof(a->name), "%s", request.account);
-                a->balance_cents = request.amount_cents;
-                snprintf(a->card_hex, sizeof(a->card_hex), "%s", request.card_hex);
-                a->next = g_accounts;
-                g_accounts = a;
-
+                memset(new_account, 0, sizeof(*new_account));
+                snprintf(new_account->name, sizeof(new_account->name), "%s", request.account);
+                new_account->balance_cents = request.amount_cents;
+                snprintf(new_account->card_hex, sizeof(new_account->card_hex), "%s", request.card_hex);
                 response.ok = 1;
                 response.has_amount = 1;
-                response.amount_cents = a->balance_cents;
-            }
+                response.amount_cents = new_account->balance_cents;
+                commit_required = 1;
+                is_create_commit = 1;
             }
         }
     }
     else if (request.operation == PROTO_OP_DEPOSIT)
     {
-        if (request.has_amount == 0 || request.card_hex[0] == '\0')
+        if (request.has_amount == 0 || !card_hex_valid(request.card_hex))
         {
             send_protocol_error = 1;
         }
@@ -244,20 +281,30 @@ static void *handle_client(void *arg)
             business_fail = 1;
         }
         else if (strcmp(found->card_hex, request.card_hex) != 0)
+        {
+            business_fail = 1;
+        }
+        else if (nonce_seen(found, request.nonce))
+        {
+            send_protocol_error = 1;
+        }
+        else if (UINT64_MAX - found->balance_cents < request.amount_cents)
         {
             business_fail = 1;
         }
         else
         {
-            found->balance_cents += request.amount_cents;
             response.ok = 1;
             response.has_amount = 1;
             response.amount_cents = request.amount_cents;
+            commit_required = 1;
+            pending_delta = request.amount_cents;
+            commit_account = found;
         }
     }
     else if (request.operation == PROTO_OP_WITHDRAW)
     {
-        if (request.has_amount == 0 || request.card_hex[0] == '\0')
+        if (request.has_amount == 0 || !card_hex_valid(request.card_hex))
         {
             send_protocol_error = 1;
         }
@@ -268,6 +315,10 @@ static void *handle_client(void *arg)
         else if (strcmp(found->card_hex, request.card_hex) != 0)
         {
             business_fail = 1;
+        }
+        else if (nonce_seen(found, request.nonce))
+        {
+            send_protocol_error = 1;
         }
         else if (found->balance_cents < request.amount_cents)
         {
@@ -275,15 +326,17 @@ static void *handle_client(void *arg)
         }
         else
         {
-            found->balance_cents -= request.amount_cents;
             response.ok = 1;
             response.has_amount = 1;
             response.amount_cents = request.amount_cents;
+            commit_required = 1;
+            pending_delta = request.amount_cents;
+            commit_account = found;
         }
     }
     else if (request.operation == PROTO_OP_GET)
     {
-        if (request.card_hex[0] == '\0')
+        if (!card_hex_valid(request.card_hex))
         {
             send_protocol_error = 1;
         }
@@ -295,11 +348,16 @@ static void *handle_client(void *arg)
         {
             business_fail = 1;
         }
+        else if (nonce_seen(found, request.nonce))
+        {
+            send_protocol_error = 1;
+        }
         else
         {
             response.ok = 1;
             response.has_amount = 1;
             response.amount_cents = found->balance_cents;
+            commit_account = found;
         }
     }
     else
@@ -307,7 +365,14 @@ static void *handle_client(void *arg)
         send_protocol_error = 1;
     }
 
-    /* prepare minimal-decimal amount string and print bank-side JSON while holding lock to preserve ordering */
+    if (business_fail)
+    {
+        response.ok = 0;
+        response.has_amount = 0;
+        response.amount_cents = 0;
+    }
+
+    /* prepare output amount text while still under lock */
     char amt_buf[64];
     if (response.has_amount)
     {
@@ -326,10 +391,13 @@ static void *handle_client(void *arg)
         }
     }
 
-    pthread_mutex_unlock(&g_accounts_lock);
-
     if (send_protocol_error)
     {
+        pthread_mutex_unlock(&g_accounts_lock);
+        if (new_account != NULL)
+        {
+            free(new_account);
+        }
         printf("protocol_error\n");
         fflush(stdout);
         crypto_secure_memzero(plaintext, plaintext_len);
@@ -339,16 +407,99 @@ static void *handle_client(void *arg)
         return NULL;
     }
 
-    if (business_fail)
+    /* build response, serialize, encrypt, and send back */
+    uint8_t *resp_plain = NULL;
+    size_t resp_plain_len = 0;
+    if (proto_serialize_response(&response, &resp_plain, &resp_plain_len) != 0)
     {
-        /* send ok=0 response (no bank JSON printed) */
-        response.ok = 0;
-        response.has_amount = 0;
-        response.amount_cents = 0;
+        pthread_mutex_unlock(&g_accounts_lock);
+        if (new_account != NULL)
+        {
+            free(new_account);
+        }
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
     }
-    else if (response.ok)
+
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (crypto_encrypt_then_mac(&g_keys, resp_plain, resp_plain_len, &wire, &wire_len) != 0)
     {
-        /* print bank-side JSON summary matching ATM output */
+        pthread_mutex_unlock(&g_accounts_lock);
+        if (new_account != NULL)
+        {
+            free(new_account);
+        }
+        crypto_secure_memzero(resp_plain, resp_plain_len);
+        free(resp_plain);
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    crypto_secure_memzero(resp_plain, resp_plain_len);
+    free(resp_plain);
+
+    if (wire_len > 2147483647ULL || send_message(client, wire, (int)wire_len) != 0)
+    {
+        pthread_mutex_unlock(&g_accounts_lock);
+        if (new_account != NULL)
+        {
+            free(new_account);
+        }
+        crypto_secure_memzero(wire, wire_len);
+        free(wire);
+        printf("protocol_error\n");
+        fflush(stdout);
+        crypto_secure_memzero(plaintext, plaintext_len);
+        free(plaintext);
+        free(msg);
+        close(client);
+        return NULL;
+    }
+
+    crypto_secure_memzero(wire, wire_len);
+    free(wire);
+
+    /* apply commit only after successful response send */
+    if (!business_fail)
+    {
+        if (is_create_commit && new_account != NULL)
+        {
+            nonce_add(new_account, pending_nonce);
+            new_account->next = g_accounts;
+            g_accounts = new_account;
+            new_account = NULL;
+        }
+        else if (commit_required && commit_account != NULL)
+        {
+            if (request.operation == PROTO_OP_DEPOSIT)
+            {
+                commit_account->balance_cents += pending_delta;
+            }
+            else if (request.operation == PROTO_OP_WITHDRAW)
+            {
+                commit_account->balance_cents -= pending_delta;
+            }
+            nonce_add(commit_account, pending_nonce);
+        }
+        else if (request.operation == PROTO_OP_GET && commit_account != NULL)
+        {
+            nonce_add(commit_account, pending_nonce);
+        }
+    }
+
+    if (response.ok)
+    {
         switch (request.operation)
         {
         case PROTO_OP_CREATE:
@@ -369,53 +520,12 @@ static void *handle_client(void *arg)
         fflush(stdout);
     }
 
-    /* build response, serialize, encrypt, and send back */
-    uint8_t *resp_plain = NULL;
-    size_t resp_plain_len = 0;
-    if (proto_serialize_response(&response, &resp_plain, &resp_plain_len) != 0)
+    pthread_mutex_unlock(&g_accounts_lock);
+
+    if (new_account != NULL)
     {
-        printf("protocol_error\n");
-        fflush(stdout);
-        crypto_secure_memzero(plaintext, plaintext_len);
-        free(plaintext);
-        free(msg);
-        close(client);
-        return NULL;
+        free(new_account);
     }
-
-    uint8_t *wire = NULL;
-    size_t wire_len = 0;
-    if (crypto_encrypt_then_mac(&g_keys, resp_plain, resp_plain_len, &wire, &wire_len) != 0)
-    {
-        crypto_secure_memzero(resp_plain, resp_plain_len);
-        free(resp_plain);
-        printf("protocol_error\n");
-        fflush(stdout);
-        crypto_secure_memzero(plaintext, plaintext_len);
-        free(plaintext);
-        free(msg);
-        close(client);
-        return NULL;
-    }
-
-    crypto_secure_memzero(resp_plain, resp_plain_len);
-    free(resp_plain);
-
-    if (wire_len > 2147483647ULL || send_message(client, wire, (int)wire_len) != 0)
-    {
-        crypto_secure_memzero(wire, wire_len);
-        free(wire);
-        printf("protocol_error\n");
-        fflush(stdout);
-        crypto_secure_memzero(plaintext, plaintext_len);
-        free(plaintext);
-        free(msg);
-        close(client);
-        return NULL;
-    }
-
-    crypto_secure_memzero(wire, wire_len);
-    free(wire);
 
     crypto_secure_memzero(plaintext, plaintext_len);
     free(plaintext);
