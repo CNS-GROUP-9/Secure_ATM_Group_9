@@ -416,7 +416,6 @@ static void *handle_client(void *arg)
 
     crypto_secure_memzero(wire, wire_len);
     free(wire);
->>>>>>> 8b48bc5 (Db + card file)
 
     crypto_secure_memzero(plaintext, plaintext_len);
     free(plaintext);
