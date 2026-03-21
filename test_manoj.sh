@@ -66,8 +66,10 @@ run_tests() {
   local bank_out="${tag}.bank.out"
   local single_out="${tag}.single.bank.out"
   local test_port=35555
+  local acct="alice"
+  local card_file="${tag}.alice.card"
 
-  trap 'if [ -n "${bank_pid:-}" ]; then kill -TERM "$bank_pid" 2>/dev/null; wait "$bank_pid" 2>/dev/null; fi; if [ -n "${single_pid:-}" ]; then kill -TERM "$single_pid" 2>/dev/null; wait "$single_pid" 2>/dev/null; fi; rm -f "${auth_file:-}" "${single_auth:-}" "${bank_out:-}" "${single_out:-}" manoj_test_*.auth manoj_test_*.bank.out manoj_test_*_single.auth atm bank' EXIT
+  trap 'if [ -n "${bank_pid:-}" ]; then kill -TERM "$bank_pid" 2>/dev/null; wait "$bank_pid" 2>/dev/null; fi; if [ -n "${single_pid:-}" ]; then kill -TERM "$single_pid" 2>/dev/null; wait "$single_pid" 2>/dev/null; fi; rm -f "${auth_file:-}" "${single_auth:-}" "${bank_out:-}" "${single_out:-}" "${card_file:-}" manoj_test_*.auth manoj_test_*.bank.out manoj_test_*_single.auth atm bank' EXIT
 
   if ! build_binaries; then
     echo "Build failed"
@@ -107,7 +109,8 @@ run_tests() {
     exit 1
   fi
 
-  assert_exit 0 "ATM connects and sends framed message" ./atm -a alice -g -p "$test_port" -s "$auth_file"
+  assert_exit 0 "ATM round-trip create works" ./atm -a "$acct" -n 20.00 -c "$card_file" -p "$test_port" -s "$auth_file"
+  assert_exit 0 "ATM round-trip get works" ./atm -a "$acct" -g -c "$card_file" -p "$test_port" -s "$auth_file"
   if grep -q "protocol_error" "$bank_out"; then
     say_fail "No protocol_error on normal ATM request"
   else
@@ -118,7 +121,7 @@ run_tests() {
   wait "$bank_pid" 2>/dev/null
   unset bank_pid
 
-  assert_exit 63 "ATM returns 63 when bank unavailable" ./atm -a alice -g -p 36666 -s "$auth_file"
+  assert_exit 63 "ATM returns 63 when bank unavailable" ./atm -a "$acct" -g -c "$card_file" -p 36666 -s "$auth_file"
 
   echo
   echo "Total: $pass_count passed, $fail_count failed"

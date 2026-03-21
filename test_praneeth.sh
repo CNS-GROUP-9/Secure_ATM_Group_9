@@ -1,99 +1,127 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=$(pwd)
-AUTH=praneeth_test.auth
-BANK_OUT=praneeth_bank.out
+AUTH="praneeth_test.auth"
+BANK_OUT="praneeth_bank.out"
 PORT=36000
-ACCOUNT=alice
-CARD=${ACCOUNT}.card
+ACCOUNT="alice"
+CARD="${ACCOUNT}.card"
 
-# build
-OPENSSL_PREFIX=$(brew --prefix openssl 2>/dev/null || true)
-CFLAGS="-I$OPENSSL_PREFIX/include"
-LDFLAGS="-L$OPENSSL_PREFIX/lib -lcrypto"
-
-gcc atm.c cli.c network.c crypto.c protocol.c -o atm $CFLAGS $LDFLAGS
-gcc bank.c cli.c network.c crypto.c protocol.c -o bank -lpthread $CFLAGS $LDFLAGS
-
-# start bank
-./bank -p $PORT -s $AUTH >$BANK_OUT 2>&1 &
-BANK_PID=$!
-
-trap 'kill -TERM "$BANK_PID" 2>/dev/null || true; wait "$BANK_PID" 2>/dev/null || true; rm -f "$AUTH" "$BANK_OUT" "$CARD" atm bank' EXIT
-
-# wait for created
-for i in {1..50}; do
-  if grep -q "^created$" "$BANK_OUT" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-done
-
-# create account alice
-rm -f "$CARD"
-./atm -a "$ACCOUNT" -n 1500.00 -p $PORT -s $AUTH
-# deposit
-./atm -a alice -d 100.00 -p $PORT -s $AUTH
-# withdraw
-./atm -a alice -w 63.10 -p $PORT -s $AUTH
-# get
-./atm -a alice -g -p $PORT -s $AUTH
-
-sleep 0.2
-
-# check expected bank outputs
-grep -q '^{"account":"alice","initial_balance":1500}$' $BANK_OUT || { echo "BANK MISSING initial_balance"; exit 2; }
-grep -q '^{"account":"alice","deposit":100}$' $BANK_OUT || { echo "BANK MISSING deposit"; exit 2; }
-grep -q '^{"account":"alice","withdraw":63.1}$' $BANK_OUT || { echo "BANK MISSING withdraw"; exit 2; }
-grep -q '^{"account":"alice","balance":1536.9}$' $BANK_OUT || { echo "BANK MISSING balance"; exit 2; }
-
-echo "test_praneeth completed"
-
-# --- extra negative tests ---
 pass_count=0
 fail_count=0
 
+say_pass() {
+  echo "[PASS] $1"
+  pass_count=$((pass_count + 1))
+}
+
+say_fail() {
+  echo "[FAIL] $1"
+  fail_count=$((fail_count + 1))
+}
+
 assert_exit() {
-  local expected=$1
+  local expected="$1"
   shift
   local name="$1"
   shift
+
   set +e
   "$@" >/dev/null 2>&1
   local code=$?
   set -e
+
   if [ "$code" -eq "$expected" ]; then
-    echo "[PASS] $name (exit=$code)"
-    pass_count=$((pass_count+1))
+    say_pass "$name (exit=$code)"
   else
-    echo "[FAIL] $name (expected $expected, got $code)"
-    fail_count=$((fail_count+1))
+    say_fail "$name (expected $expected, got $code)"
   fi
+}
+
+wait_for_created() {
+  local retries=50
+
+  while [ "$retries" -gt 0 ]; do
+    if grep -q "^created$" "$BANK_OUT" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    retries=$((retries - 1))
+  done
+
+  return 1
+}
+
+cleanup() {
+  if [ -n "${BANK_PID:-}" ]; then
+    kill -TERM "$BANK_PID" 2>/dev/null || true
+    wait "$BANK_PID" 2>/dev/null || true
+  fi
+  rm -f "$AUTH" "$BANK_OUT" "$CARD" bob.card bad.card atm bank
+}
+
+trap cleanup EXIT
+
+# build
+gcc atm.c cli.c network.c crypto.c protocol.c -o atm -lcrypto
+gcc bank.c cli.c network.c crypto.c protocol.c -o bank -lpthread -lcrypto
+say_pass "Build atm/bank"
+
+# start bank
+./bank -p "$PORT" -s "$AUTH" >"$BANK_OUT" 2>&1 &
+BANK_PID=$!
+
+if wait_for_created; then
+  say_pass "Bank prints created"
+else
+  say_fail "Bank prints created"
+  echo
+  echo "Total: $pass_count passed, $fail_count failed"
+  exit 2
+fi
+
+if [ -f "$AUTH" ]; then
+  say_pass "Bank creates auth file"
+else
+  say_fail "Bank creates auth file"
+fi
+
+# positive flow
+rm -f "$CARD"
+assert_exit 0 "create account" ./atm -a "$ACCOUNT" -n 1500.00 -p "$PORT" -s "$AUTH"
+assert_exit 0 "deposit" ./atm -a "$ACCOUNT" -d 100.00 -p "$PORT" -s "$AUTH"
+assert_exit 0 "withdraw" ./atm -a "$ACCOUNT" -w 63.10 -p "$PORT" -s "$AUTH"
+assert_exit 0 "get balance" ./atm -a "$ACCOUNT" -g -p "$PORT" -s "$AUTH"
+
+sleep 0.2
+
+grep -q '^{"account":"alice","initial_balance":1500}$' "$BANK_OUT" || {
+  say_fail "BANK missing initial_balance JSON"
+}
+grep -q '^{"account":"alice","deposit":100}$' "$BANK_OUT" || {
+  say_fail "BANK missing deposit JSON"
+}
+grep -q '^{"account":"alice","withdraw":63.1}$' "$BANK_OUT" || {
+  say_fail "BANK missing withdraw JSON"
+}
+grep -q '^{"account":"alice","balance":1536.9}$' "$BANK_OUT" || {
+  say_fail "BANK missing balance JSON"
 }
 
 echo "Running negative tests..."
 
-# duplicate create should fail
-assert_exit 255 "duplicate create" ./atm -a "$ACCOUNT" -n 2000.00 -p $PORT -s $AUTH
+assert_exit 255 "duplicate create" ./atm -a "$ACCOUNT" -n 2000.00 -p "$PORT" -s "$AUTH"
+assert_exit 255 "insufficient funds withdraw" ./atm -a "$ACCOUNT" -w 2000000.00 -p "$PORT" -s "$AUTH"
 
-# withdraw too much should fail
-assert_exit 255 "insufficient funds withdraw" ./atm -a "$ACCOUNT" -w 2000000.00 -p $PORT -s $AUTH
-
-# create another account bob to get a bob.card
 rm -f bob.card
-assert_exit 0 "create bob" ./atm -a bob -n 10.00 -p $PORT -s $AUTH
+assert_exit 0 "create bob" ./atm -a bob -n 10.00 -p "$PORT" -s "$AUTH"
+assert_exit 255 "wrong card access" ./atm -a "$ACCOUNT" -g -p "$PORT" -s "$AUTH" -c bob.card
 
-# using bob's card to access alice should fail
-assert_exit 255 "wrong card access" ./atm -a "$ACCOUNT" -g -p $PORT -s $AUTH -c bob.card
-
-# corrupted card file should fail
 echo "zzzz" > bad.card
-assert_exit 255 "corrupted card file" ./atm -a "$ACCOUNT" -g -p $PORT -s $AUTH -c bad.card
-rm -f bad.card
+assert_exit 255 "corrupted card file" ./atm -a "$ACCOUNT" -g -p "$PORT" -s "$AUTH" -c bad.card
 
 echo
-echo "Negative tests: $pass_count passed, $fail_count failed"
+echo "Total: $pass_count passed, $fail_count failed"
 if [ "$fail_count" -ne 0 ]; then
   exit 2
 fi
