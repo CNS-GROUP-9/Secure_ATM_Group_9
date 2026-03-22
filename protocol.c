@@ -1,4 +1,6 @@
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <openssl/rand.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -131,8 +133,19 @@ static int find_uint64_value(const char *json, const char *key, uint64_t *value)
         return -1;
     }
 
+    errno = 0;
     parsed = strtoull(start, &endptr, 10);
-    if (endptr == start)
+    if (endptr == start || errno == ERANGE)
+    {
+        return -1;
+    }
+
+    if (*endptr != ',' && *endptr != '}' && !isspace((unsigned char)*endptr))
+    {
+        return -1;
+    }
+
+    if (start[0] == '0' && (endptr - start) > 1)
     {
         return -1;
     }

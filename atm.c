@@ -10,6 +10,53 @@
 #include <errno.h>
 #include <ctype.h>
 
+static int write_card_file(const char *path, const char *card_hex)
+{
+    FILE *f;
+    size_t written;
+
+    if (path == NULL || card_hex == NULL)
+    {
+        return -1;
+    }
+
+    f = fopen(path, "wb");
+    if (!f)
+    {
+        return -1;
+    }
+
+    written = fwrite(card_hex, 1, AUTH_SECRET_BYTES * 2, f);
+    if (written != AUTH_SECRET_BYTES * 2)
+    {
+        fclose(f);
+        unlink(path);
+        return -1;
+    }
+
+    if (fputc('\n', f) == EOF)
+    {
+        fclose(f);
+        unlink(path);
+        return -1;
+    }
+
+    if (fflush(f) != 0)
+    {
+        fclose(f);
+        unlink(path);
+        return -1;
+    }
+
+    if (fclose(f) != 0)
+    {
+        unlink(path);
+        return -1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     ATMArgs args;
@@ -55,7 +102,6 @@ int main(int argc, char **argv)
     if (args.mode == 1) /* create */
     {
         unsigned char card_secret[AUTH_SECRET_BYTES];
-        char hex[AUTH_SECRET_BYTES * 2 + 2];
         static const char digits[] = "0123456789abcdef";
         size_t i;
 
@@ -70,26 +116,9 @@ int main(int argc, char **argv)
         }
         for (i = 0; i < sizeof(card_secret); i++)
         {
-            hex[i * 2] = digits[(card_secret[i] >> 4) & 0xF];
-            hex[i * 2 + 1] = digits[card_secret[i] & 0xF];
+            request.card_hex[i * 2] = digits[(card_secret[i] >> 4) & 0xF];
+            request.card_hex[i * 2 + 1] = digits[card_secret[i] & 0xF];
         }
-        hex[AUTH_SECRET_BYTES * 2] = '\n';
-        hex[AUTH_SECRET_BYTES * 2 + 1] = '\0';
-        FILE *f = fopen(args.card_file, "wb");
-        if (!f)
-        {
-            exit(255);
-        }
-        if (fwrite(hex, 1, AUTH_SECRET_BYTES * 2 + 1, f) != AUTH_SECRET_BYTES * 2 + 1)
-        {
-            fclose(f);
-            unlink(args.card_file);
-            exit(255);
-        }
-        if (fflush(f) != 0) { fclose(f); unlink(args.card_file); exit(255); }
-        if (fclose(f) != 0) { unlink(args.card_file); exit(255); }
-        /* set card_hex (without newline) */
-        memcpy(request.card_hex, hex, AUTH_SECRET_BYTES * 2 + 1);
         request.card_hex[AUTH_SECRET_BYTES * 2] = '\0';
         crypto_secure_memzero(card_secret, sizeof(card_secret));
     }
@@ -221,6 +250,18 @@ int main(int argc, char **argv)
         close(sock);
         crypto_secure_memzero(&keys, sizeof(keys));
         exit(255);
+    }
+
+    if (args.mode == 1)
+    {
+        if (write_card_file(args.card_file, request.card_hex) != 0)
+        {
+            crypto_secure_memzero(resp_plain, resp_plain_len);
+            free(resp_plain);
+            close(sock);
+            crypto_secure_memzero(&keys, sizeof(keys));
+            exit(255);
+        }
     }
 
     /* helper: format cents -> minimal decimal string */
