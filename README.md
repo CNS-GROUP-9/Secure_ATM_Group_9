@@ -1,142 +1,199 @@
-# Secure_ATM_Group_9
+# Secure ATM
 
-## Manoj Module Status
+Secure ATM is a C-based client-server system with two binaries:
 
-Command-line Parser + Network Communication Module: complete and tested.
+- bank: TCP server that stores account state and processes requests.
+- atm: client CLI that validates input, builds requests, and prints output.
 
-Implemented:
+Communication is authenticated and encrypted using OpenSSL.
 
-- ATM argument parsing for `-a -n -d -w -g -s -i -p -c`
-- strict validation (duplicates, formats, ranges, defaults)
-- bank argument parsing for `-p -s`
-- TCP client/server communication
-- length-prefixed framing (`len || message`)
-- socket timeouts
-- bank thread-per-connection model
-- bank auth-file creation on startup
+## Security Model
 
-## Saharsh Module Status
+The system assumes a man-in-the-middle attacker can observe, modify, inject, or replay network traffic between ATM and bank.
 
-Cryptographic Module + Protocol Serialization Module: complete and tested.
+- The attacker does not have the shared auth file distributed through a trusted channel.
+- Account access is additionally gated by per-account card secrets in card files.
+- The protocol is designed to provide confidentiality, integrity, endpoint authentication, and replay resistance.
 
-Implemented:
+## Project Structure
 
-- auth-file secret loading from bank-generated hex key material
-- key derivation for separate encryption and MAC keys
-- AES-256-CBC encryption for protocol payloads
-- HMAC-SHA256 authentication over encrypted payloads
-- encrypt-then-MAC and verify-then-decrypt helpers
-- secure memory wiping for derived secrets and plaintext buffers
-- protocol request struct for ATM-to-bank messages
-- protocol response struct for bank-to-ATM messages
-- serialization of request/response payloads into JSON-like plaintext
-- deserialization and validation of decrypted request/response payloads
-- nonce generation for per-request freshness
-- amount conversion to integer cents before serialization
-- ATM integration: build request, serialize, encrypt, send
-- bank integration: receive, decrypt, deserialize, validate
+- atm.c: ATM client flow, card file handling, request/response integration.
+- bank.c: Bank server, auth file creation, request handling, in-memory account database.
+- cli.c / cli.h: command-line parsing and validation.
+- network.c / network.h: framed TCP send/receive with timeouts.
+- crypto.c / crypto.h: key loading/derivation, encrypt-then-MAC, verify-then-decrypt.
+- protocol.c / protocol.h: request/response serialization and deserialization.
+- build/Makefile: build rules for both binaries.
+- test_comprehensive.sh: end-to-end and negative-path test suite.
 
 ## Build
 
-```bash
-gcc atm.c cli.c network.c crypto.c protocol.c -o atm -lcrypto
-gcc bank.c cli.c network.c crypto.c protocol.c -o bank -lpthread -lcrypto
-```
-
-## Verify (WSL)
+From repository root:
 
 ```bash
-wsl bash -lc "cd '/mnt/c/Users/Manoj/OneDrive/Acads/sem 6/CNS/CNS_Proj'; ./test_manoj.sh"
+cd build
+make clean
+make
 ```
 
-Expected result:
+This creates:
 
-- all tests pass
-- summary prints `Total: 13 passed, 0 failed`
+- build/atm
+- build/bank
 
-Tested:
+## Run
 
-- build succeeds for `atm` and `bank`
-- ATM rejects invalid CLI inputs with exit `255`
-- duplicate mode/options are rejected
-- invalid port, amount format, and IPv4 are rejected
-- bank prints `created` and generates auth file on startup
-- bank rejects existing auth file with exit `255`
-- bank accepts ATM connection and framed request path works
-- ATM returns exit `63` when bank is unreachable
-- encrypted message path works between ATM and bank
-- malformed decrypted request payloads are rejected as protocol errors
-- serialized request format is accepted by bank worker after decryption
+Open two terminals in repository root.
 
-## Next Member Handoff
-
-
-
--------------
-For Praneeth (DB + Card File): complete and tested.
-
-Implemented:
-
-- Added card-file handling in the ATM: create (`-n`) generates a 32-byte card secret, writes a hex card file, and validates existing card files for other operations.
-- Extended the protocol to carry a hex-encoded card secret (`card_hex`) in `ProtocolRequest` and updated `protocol.c` serializers/deserializers accordingly.
-- Implemented an in-memory bank database (linked list) storing account name, `balance_cents` (uint64_t), and `card_hex`, protected by a mutex.
-- Implemented business handlers in `bank.c`: CREATE (initial balance), DEPOSIT, WITHDRAW (with insufficient-funds check), and GET (balance). All amounts use integer cents internally.
-- Bank prints minimal JSON summaries on successful operations (matching ATM output) while holding the DB lock to preserve ordering.
-- Bank distinguishes protocol errors (prints `protocol_error`) from business failures (sends back `ok=0`); ATM exits with the required codes (255 for business failure, 63 for protocol/timeout errors).
-- ATM now waits for, verifies, decrypts, and deserializes bank responses and prints spec-compliant JSON output.
-- Added `test_praneeth.sh` with positive and negative tests (duplicate create, insufficient funds, wrong card, corrupted card) and verified the flow locally.
-
-Files changed (high level):
-
-- `protocol.h` / `protocol.c` — added `card_hex` field and updated serialization/deserialization.
-- `atm.c` — card-file create/read, include `card_hex` in requests, response decryption and JSON output.
-- `bank.c` — in-memory DB, business handlers, JSON printing, response encryption.
-- `test_praneeth.sh` — automated some positive and negative tests.
-
-Remaining / recommended improvements:
-
-- Replace sending raw card secret over the wire with a proof-of-possession scheme (HMAC over a nonce) to avoid exposing the card secret.
-- Add persistence (on-disk DB) if accounts must survive bank restarts.
-- Add more unit tests and CI (Makefile + workflow) for reproducible builds and automated test runs.
-- Harden input validation and logging, and add limits for number of accounts / memory usage.
-- Consider protocol versioning and backward-compatibility tests if fields change further.
---------------------------
-
-For Praneeth (DB + Card File):
-
-- Implement account database storage in bank memory.
-- Store at minimum: account name, balance in cents, and card secret.
-- Use integer cents internally for balances and transaction amounts.
-- Add create/deposit/withdraw/get handlers after request deserialization in `bank.c`.
-- Reject invalid business logic with exit/response behavior required by spec.
-- Create and read card files in ATM using the validated account/card filename inputs from `cli.c`.
-- On `-n`, generate a new card secret, write the card file, and include that secret in the account-creation flow.
-- On `-d`, `-w`, and `-g`, read the card file and attach/validate account ownership data.
-- Extend `ProtocolRequest` and `ProtocolResponse` in `protocol.h` if card-secret or status fields are needed.
-- Update `protocol.c` serializer/deserializer consistently on both ATM and bank sides if message fields change.
-- After business logic is implemented, ATM should decrypt and deserialize bank responses instead of only sending requests.
-- Print final JSON outputs exactly as required by the assignment after successful operations.
-
-Stable integration points already ready:
-
-- argument parsing: `parse_atm_args()`, `parse_bank_args()` in `cli.c`
-- transport framing: `send_message()`, `receive_message()` in `network.c`
-- crypto helpers: `crypto_load_auth_secret()`, `crypto_derive_keys()`, `crypto_encrypt_then_mac()`, `crypto_verify_then_decrypt()` in `crypto.c`
-- protocol helpers: `proto_serialize_request()`, `proto_deserialize_request()`, `proto_serialize_response()`, `proto_deserialize_response()` in `protocol.c`
-- server concurrency path: `handle_client()` in `bank.c`
-
-Suggested implementation order for Praneeth:
-
-1. Add account and card-secret fields to protocol messages as needed.
-2. Implement card file generation and loading in ATM.
-3. Implement in-memory account database in bank.
-4. Process each deserialized request in `handle_client()`.
-5. Serialize, encrypt, send bank responses back to ATM.
-6. Deserialize bank responses in ATM and print spec-compliant JSON.
-
-## Quick Manual Run
+### 1) Start bank
 
 ```bash
 ./bank -p 3000 -s bank.auth
+```
+
+Expected behavior:
+
+- Prints created on startup.
+- Creates bank.auth if it does not already exist.
+
+### 2) Run ATM commands
+
+Create account:
+
+```bash
+./atm -a alice -n 1000.00 -p 3000 -s bank.auth
+```
+
+Deposit:
+
+```bash
+./atm -a alice -d 100.00 -p 3000 -s bank.auth
+```
+
+Withdraw:
+
+```bash
+./atm -a alice -w 63.10 -p 3000 -s bank.auth
+```
+
+Get balance:
+
+```bash
 ./atm -a alice -g -p 3000 -s bank.auth
 ```
+
+Optional card file path:
+
+```bash
+./atm -a alice -g -p 3000 -s bank.auth -c alice.card
+```
+
+## Brief Code Logic
+
+Each ATM operation follows this high-level pipeline:
+
+1. Parse and validate CLI input.
+2. Load auth secret and derive crypto keys.
+3. Build protocol request (including account, operation, amount/card data).
+4. Serialize request payload.
+5. Encrypt payload and attach MAC.
+6. Send framed message to bank over TCP.
+7. Receive framed response from bank.
+8. Verify MAC, decrypt response, deserialize fields.
+9. Print required JSON output or return failure code.
+
+Each bank worker thread follows this high-level pipeline:
+
+1. Receive framed request.
+2. Verify MAC and decrypt payload.
+3. Deserialize request and validate protocol fields.
+4. Execute business logic on in-memory account data (mutex protected).
+5. Build response (success or business failure).
+6. Serialize, encrypt, MAC, and send response.
+
+## Protocol and Key Design
+
+- Shared root secret: bank generates an auth file on startup; ATM and bank load it locally.
+- Key derivation: two independent keys are derived using SHA-256 labels (`ENC` and `MAC`).
+- Message protection: Encrypt-Then-MAC using AES-256-CBC and HMAC-SHA256.
+- Framing: length-prefixed TCP messages (`len || payload`) with socket timeouts.
+- Freshness: ATM includes a nonce per request; bank tracks recently seen nonces (sliding window) to reject replays.
+- Account ownership: ATM includes card secret in protected request data; bank validates it against account state.
+
+## Command-Line Contract
+
+Supported forms:
+
+- `bank [-p <port>] [-s <auth-file>]`
+- `atm ... -a <account> -n <balance>`
+- `atm ... -a <account> -d <amount>`
+- `atm ... -a <account> -w <amount>`
+- `atm ... -a <account> -g`
+
+Defaults:
+
+- `bank`: port `3000`, auth file `bank.auth`
+- `atm`: IP `127.0.0.1`, port `3000`, auth file `bank.auth`, card file `<account>.card`
+
+Rules enforced by CLI parser:
+
+- Arguments may appear in any order.
+- Clustered options such as `-ga` are accepted.
+- Missing required parameters, duplicated parameters, unknown options, or invalid values return exit code `255` with no stdout output.
+
+## Input and Output Guarantees
+
+Input validation includes:
+
+- Port range `1024..65535`.
+- IPv4 dotted-decimal format checks.
+- Account/file character restrictions and length checks.
+- Currency format checks with two fractional digits and internal cents conversion.
+
+Output behavior:
+
+- Successful transaction output is single-line JSON followed by `\n`.
+- Bank prints `created` after writing auth file completely.
+- Bank prints `protocol_error` on protocol violations and continues serving other clients.
+- stdout is flushed after each printed line.
+
+## Exit and Error Behavior
+
+- Exit 0: successful ATM operation.
+- Exit 255: invalid CLI input or business-rule failure.
+- Exit 63: transport/protocol/timeout errors.
+- Protocol errors trigger rollback of the current transaction on bank side.
+- Bank logs protocol_error for malformed, tampered, replayed, or timed-out protocol requests.
+
+## Test (Optional)
+
+Run the comprehensive test suite from repository root:
+
+```bash
+bash test_comprehensive.sh
+```
+
+The script builds binaries, runs positive and negative scenarios, and prints a final summary line:
+
+- Total: X passed, Y failed
+
+### What We Tested (35 Tests)
+
+The 35 checks in `test_comprehensive.sh` cover the following:
+
+- Build and helper compilation: verifies `atm` and `bank` build cleanly and protocol helper clients compile.
+- CLI validation: rejects missing account, duplicate modes/options, invalid ports, invalid amount formats, invalid IPv4, and invalid bank options.
+- Bank startup behavior: confirms startup prints `created`, creates auth file, and rejects reuse of an existing auth file.
+- Core transaction flow: verifies successful create, deposit, withdraw, and get-balance responses with expected JSON output.
+- Business-rule failures: verifies duplicate account creation, insufficient funds, wrong card access, and corrupted card file handling.
+- Option parsing edge cases: verifies clustered ATM options (for example, `-ga`) work correctly.
+- Output format checks: confirms successful output includes a trailing newline.
+- Protocol robustness: verifies malformed frame handling and timeout behavior produce `protocol_error` on bank side.
+- Network failure paths: verifies ATM returns the expected error code when bank is unreachable or response times out.
+- Restart/auth semantics: verifies behavior with old auth material after bank restart and confirms in-memory state is not persisted.
+
+## Notes
+
+- Bank state is in-memory and is not persisted across restarts.
+- Existing auth file is treated as an error for bank startup with the same path.
+- The command "make clean" removes the bankdir and atmdir, so when it is run all current accounts are lost.
