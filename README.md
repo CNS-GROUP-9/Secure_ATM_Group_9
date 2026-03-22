@@ -57,7 +57,7 @@ Expected behavior:
 - Creates bank.auth if it does not already exist.
 
 ### 2) Run ATM commands
-
+(These work correctly if run from build directory. You can also run them from other directories, then use absolute path or the path of the binary relative to it)
 Create account:
 
 ```bash
