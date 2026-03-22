@@ -14,5 +14,7 @@ bank: ../bank.c $(COMMON_SRCS) $(COMMON_HDRS)
 
 clean:
 	rm -f atm bank
+	@if [ -d bankdir ]; then find bankdir ! -type d -delete; find bankdir -depth -type d -exec rmdir {} +; fi
+	@if [ -d atmdir ]; then find atmdir ! -type d -delete; find atmdir -depth -type d -exec rmdir {} +; fi
 
 .PHONY: all clean
