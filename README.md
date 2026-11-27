@@ -104,12 +104,11 @@ Each ATM operation follows this high-level pipeline:
 
 Each bank worker thread follows this high-level pipeline:
 
-1. Receive framed request.
-2. Verify MAC and decrypt payload.
-3. Deserialize request and validate protocol fields.
-4. Execute business logic on in-memory account data (mutex protected).
-5. Build response (success or business failure).
-6. Serialize, encrypt, MAC, and send response.
+1. Send a CHALLENGE containing a fresh 128-bit server nonce for this connection.
+2. Receive the framed request, verify MAC, decrypt, deserialize; reject it unless it carries this connection's server nonce.
+3. PREPARE the transaction under the account's own mutex (reserve funds / mark a new account as pending). The lock is released before any network I/O.
+4. Serialize, encrypt, MAC, and send the RESPONSE (echoes both nonces, account, operation, amount).
+5. For create/deposit/withdraw, wait for the ATM's COMMIT: on a valid COMMIT apply the change, otherwise roll it back and print protocol_error.
 
 ## Protocol and Key Design
 
@@ -117,8 +116,11 @@ Each bank worker thread follows this high-level pipeline:
 - Key derivation: two independent keys are derived using SHA-256 labels (`ENC` and `MAC`).
 - Message protection: Encrypt-Then-MAC using AES-256-CBC and HMAC-SHA256.
 - Framing: length-prefixed TCP messages (`len || payload`) with socket timeouts.
-- Freshness: ATM includes a nonce per request; bank tracks recently seen nonces (sliding window) to reject replays.
-- Account ownership: ATM includes card secret in protected request data; bank validates it against account state.
+- Freshness: challenge-response. The bank sends a fresh random server nonce per connection and only accepts a request carrying it, so a captured request can never be replayed (no nonce window to exhaust). The ATM adds its own client nonce; the response echoes both, so a captured response can never be passed off as the answer to a different request.
+- Two-phase commit: the bank prepares (reserves) a transaction, sends the response, and only commits after the ATM's authenticated COMMIT message; any protocol failure before that rolls the transaction back.
+- Concurrency: a short-lived map lock for account lookup plus one mutex per account; no lock is ever held during network I/O, and concurrent worker threads are capped.
+- Account ownership: on create the ATM writes the card file (O_EXCL | O_NOFOLLOW, mode 0600) before contacting the bank and removes it if the transaction fails. The bank stores only SHA-256 of the card secret and compares it in constant time.
+- Message types: every message has a "type" field (challenge / request / response / commit), so messages cannot be reflected or substituted.
 
 ## Command-Line Contract
 

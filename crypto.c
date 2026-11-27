@@ -1,3 +1,7 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <unistd.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -35,51 +39,118 @@ void crypto_secure_memzero(void *buf, size_t len)
     OPENSSL_cleanse(buf, len);
 }
 
-int crypto_load_auth_secret(const char *auth_file, uint8_t secret[AUTH_SECRET_BYTES])
+int crypto_random_bytes(uint8_t *buf, size_t len)
 {
-    FILE *f = NULL;
-    char line[128];
-    size_t len;
+    if (buf == NULL || len == 0 || len > INT_MAX)
+    {
+        return -1;
+    }
+    return RAND_bytes(buf, (int)len) == 1 ? 0 : -1;
+}
+
+void crypto_hex_encode(const uint8_t *in, size_t len, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
     size_t i;
 
-    if (auth_file == NULL || secret == NULL)
+    for (i = 0; i < len; i++)
+    {
+        out[i * 2] = digits[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = digits[in[i] & 0xF];
+    }
+    out[len * 2] = '\0';
+}
+
+int crypto_hex_decode(const char *hex, size_t hex_len, uint8_t *out)
+{
+    size_t i;
+
+    if (hex == NULL || out == NULL || (hex_len % 2) != 0)
     {
         return -1;
     }
-
-    f = fopen(auth_file, "rb");
-    if (f == NULL)
+    for (i = 0; i < hex_len / 2; i++)
     {
-        return -1;
-    }
-
-    if (fgets(line, sizeof(line), f) == NULL)
-    {
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-
-    len = strcspn(line, "\r\n");
-    line[len] = '\0';
-    if (len != AUTH_SECRET_BYTES * 2)
-    {
-        return -1;
-    }
-
-    for (i = 0; i < AUTH_SECRET_BYTES; i++)
-    {
-        int hi = hex_value(line[i * 2]);
-        int lo = hex_value(line[i * 2 + 1]);
+        int hi = hex_value(hex[i * 2]);
+        int lo = hex_value(hex[i * 2 + 1]);
         if (hi < 0 || lo < 0)
         {
-            crypto_secure_memzero(secret, AUTH_SECRET_BYTES);
+            crypto_secure_memzero(out, hex_len / 2);
             return -1;
         }
-        secret[i] = (uint8_t)((hi << 4) | lo);
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+int crypto_sha256(const uint8_t *in, size_t len, uint8_t out[SHA256_BYTES])
+{
+    if (in == NULL || out == NULL)
+    {
+        return -1;
+    }
+    return SHA256(in, len, out) == NULL ? -1 : 0;
+}
+
+int crypto_ct_equal(const void *a, const void *b, size_t len)
+{
+    return CRYPTO_memcmp(a, b, len) == 0;
+}
+
+int crypto_read_secret_file(const char *path, uint8_t secret[AUTH_SECRET_BYTES])
+{
+    /* Room for 64 hex chars + '\n' + 1 extra byte to detect trailing data. */
+    char buf[AUTH_SECRET_BYTES * 2 + 2];
+    size_t total = 0;
+    int fd;
+    int rc = -1;
+
+    if (path == NULL || secret == NULL)
+    {
+        return -1;
     }
 
-    return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    while (total < sizeof(buf))
+    {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - total);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            close(fd);
+            crypto_secure_memzero(buf, sizeof(buf));
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        total += (size_t)n;
+    }
+    close(fd);
+
+    /* Exactly 64 hex chars, optionally followed by exactly one newline. */
+    if (total == AUTH_SECRET_BYTES * 2 ||
+        (total == AUTH_SECRET_BYTES * 2 + 1 && buf[AUTH_SECRET_BYTES * 2] == '\n'))
+    {
+        rc = crypto_hex_decode(buf, AUTH_SECRET_BYTES * 2, secret);
+    }
+
+    crypto_secure_memzero(buf, sizeof(buf));
+    return rc;
+}
+
+int crypto_load_auth_secret(const char *auth_file, uint8_t secret[AUTH_SECRET_BYTES])
+{
+    return crypto_read_secret_file(auth_file, secret);
 }
 
 int crypto_derive_keys(const uint8_t secret[AUTH_SECRET_BYTES], CryptoKeys *keys)
